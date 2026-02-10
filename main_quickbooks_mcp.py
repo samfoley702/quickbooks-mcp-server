@@ -5,6 +5,7 @@ from api_importer import load_apis
 import sys
 import json
 from pathlib import Path
+from typing import Union
 
 # Initialize QuickBooks session with error handling
 quickbooks = None
@@ -54,6 +55,163 @@ def query_quickbooks(query: str) -> types.TextContent:
         return types.TextContent(type='text', text=str(response))
     except Exception as e:
         return types.TextContent(type='text', text=f"Error executing query: {e}")
+
+# ── Write Tools ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def update_entity(entity_type: str, entity_data: Union[str, dict]) -> types.TextContent:
+    """
+    Updates an existing QuickBooks entity using a sparse update (only sends changed fields).
+    Use this to deactivate accounts, update vendor info, modify customers, etc.
+
+    Parameters:
+    - entity_type: The QuickBooks entity type (e.g., 'Account', 'Vendor', 'Customer', 'Invoice', 'Purchase')
+    - entity_data: A JSON string with the fields to update. MUST include 'Id' and 'SyncToken'.
+      Set 'sparse': true to only update specified fields.
+
+    Examples:
+    - Deactivate an account: entity_data='{"Id": "138", "SyncToken": "0", "sparse": true, "Active": false}'
+    - Deactivate a vendor: entity_data='{"Id": "71", "SyncToken": "0", "sparse": true, "Active": false}'
+    - Update customer name: entity_data='{"Id": "5", "SyncToken": "0", "sparse": true, "DisplayName": "Acme Corp"}'
+
+    IMPORTANT: Always query the entity first to get the current SyncToken before updating.
+    """
+    if quickbooks is None:
+        return types.TextContent(type='text', text="Error: QuickBooks session not initialized.")
+
+    if isinstance(entity_data, dict):
+        data = entity_data
+    else:
+        try:
+            data = json.loads(entity_data)
+        except json.JSONDecodeError as e:
+            return types.TextContent(type='text', text=f"Error: Invalid JSON in entity_data: {e}")
+
+    entity_lower = entity_type.lower()
+    route = f"/{entity_lower}"
+
+    print(f"Updating {entity_type} with data: {data}", file=sys.stderr)
+
+    try:
+        response = quickbooks.call_route(method_type='post', route=route, body=data)
+        return types.TextContent(type='text', text=json.dumps(response, indent=2) if isinstance(response, dict) else str(response))
+    except Exception as e:
+        return types.TextContent(type='text', text=f"Error updating {entity_type}: {e}")
+
+
+@mcp.tool()
+def create_entity(entity_type: str, entity_data: Union[str, dict]) -> types.TextContent:
+    """
+    Creates a new QuickBooks entity (Invoice, Purchase, JournalEntry, Vendor, Customer, etc.).
+
+    Parameters:
+    - entity_type: The QuickBooks entity type (e.g., 'Invoice', 'Purchase', 'JournalEntry', 'Vendor', 'Customer')
+    - entity_data: A JSON string with the entity fields.
+
+    Examples:
+    - Create invoice: entity_data='{"CustomerRef": {"value": "1"}, "Line": [{"Amount": 5000, "DetailType": "SalesItemLineDetail", "SalesItemLineDetail": {"ItemRef": {"value": "1"}}}]}'
+    - Create purchase: entity_data='{"AccountRef": {"value": "140"}, "PaymentType": "Cash", "Line": [{"Amount": 100, "DetailType": "AccountBasedExpenseLineDetail", "AccountBasedExpenseLineDetail": {"AccountRef": {"value": "7100"}}}]}'
+    - Create vendor: entity_data='{"DisplayName": "New Vendor Inc"}'
+
+    IMPORTANT: Use get_quickbooks_entity_schema first to understand the required fields for the entity type.
+    """
+    if quickbooks is None:
+        return types.TextContent(type='text', text="Error: QuickBooks session not initialized.")
+
+    if isinstance(entity_data, dict):
+        data = entity_data
+    else:
+        try:
+            data = json.loads(entity_data)
+        except json.JSONDecodeError as e:
+            return types.TextContent(type='text', text=f"Error: Invalid JSON in entity_data: {e}")
+
+    entity_lower = entity_type.lower()
+    route = f"/{entity_lower}"
+
+    print(f"Creating {entity_type} with data: {data}", file=sys.stderr)
+
+    try:
+        response = quickbooks.call_route(method_type='post', route=route, body=data)
+        return types.TextContent(type='text', text=json.dumps(response, indent=2) if isinstance(response, dict) else str(response))
+    except Exception as e:
+        return types.TextContent(type='text', text=f"Error creating {entity_type}: {e}")
+
+
+@mcp.tool()
+def delete_entity(entity_type: str, entity_id: str, sync_token: str) -> types.TextContent:
+    """
+    Deletes a QuickBooks entity. Only certain entity types support deletion (e.g., Purchase, Invoice, Bill, Payment, JournalEntry).
+    Accounts, Vendors, and Customers cannot be deleted — use update_entity to deactivate them instead.
+
+    Parameters:
+    - entity_type: The QuickBooks entity type (e.g., 'Purchase', 'Invoice', 'Bill', 'Payment', 'JournalEntry')
+    - entity_id: The Id of the entity to delete
+    - sync_token: The current SyncToken of the entity (query the entity first to get this)
+
+    IMPORTANT: This action is PERMANENT and cannot be undone. Always confirm before deleting.
+    """
+    if quickbooks is None:
+        return types.TextContent(type='text', text="Error: QuickBooks session not initialized.")
+
+    entity_lower = entity_type.lower()
+    route = f"/{entity_lower}"
+    body = {"Id": entity_id, "SyncToken": sync_token}
+
+    print(f"Deleting {entity_type} Id={entity_id} SyncToken={sync_token}", file=sys.stderr)
+
+    try:
+        response = quickbooks.call_route(method_type='post', route=route, params={"operation": "delete"}, body=body)
+        return types.TextContent(type='text', text=json.dumps(response, indent=2) if isinstance(response, dict) else str(response))
+    except Exception as e:
+        return types.TextContent(type='text', text=f"Error deleting {entity_type}: {e}")
+
+
+@mcp.tool()
+def batch_operation(operations: Union[str, dict]) -> types.TextContent:
+    """
+    Executes multiple QuickBooks operations in a single API call using the batch endpoint.
+    Useful for bulk updates like deactivating many accounts at once.
+
+    Parameters:
+    - operations: A JSON string containing a list of batch operations.
+      Each operation needs: 'bId' (unique batch id), 'operation' (create/update/delete/query), and entity data.
+
+    Example - deactivate multiple accounts:
+    operations='{"BatchItemRequest": [
+      {"bId": "1", "operation": "update", "Account": {"Id": "138", "SyncToken": "0", "sparse": true, "Active": false}},
+      {"bId": "2", "operation": "update", "Account": {"Id": "137", "SyncToken": "0", "sparse": true, "Active": false}}
+    ]}'
+
+    Example - delete multiple purchases:
+    operations='{"BatchItemRequest": [
+      {"bId": "1", "operation": "delete", "Purchase": {"Id": "6", "SyncToken": "0"}},
+      {"bId": "2", "operation": "delete", "Purchase": {"Id": "4", "SyncToken": "1"}}
+    ]}'
+
+    IMPORTANT: Maximum 30 operations per batch. Each entity must include its current SyncToken.
+    """
+    if quickbooks is None:
+        return types.TextContent(type='text', text="Error: QuickBooks session not initialized.")
+
+    if isinstance(operations, dict):
+        data = operations
+    else:
+        try:
+            data = json.loads(operations)
+        except json.JSONDecodeError as e:
+            return types.TextContent(type='text', text=f"Error: Invalid JSON in operations: {e}")
+
+    print(f"Executing batch with {len(data.get('BatchItemRequest', []))} operations", file=sys.stderr)
+
+    try:
+        response = quickbooks.call_route(method_type='post', route='/batch', body=data)
+        return types.TextContent(type='text', text=json.dumps(response, indent=2) if isinstance(response, dict) else str(response))
+    except Exception as e:
+        return types.TextContent(type='text', text=f"Error executing batch: {e}")
+
+
+# ── Dynamic Read API Registration ────────────────────────────────────────────
 
 def register_all_apis():
     apis = load_apis()
